@@ -27,6 +27,7 @@ executable chat-exe
   build-depends:       base
                      , chat
                      , containers >= 0.5.7.1
+                     , network
                      , stm
   default-language:    Haskell2010
 

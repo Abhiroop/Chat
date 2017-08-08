@@ -1,14 +1,19 @@
 {-# LANGUAGE RecordWildCards #-}
 module Main where
 
+import Control.Concurrent (forkFinally)
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM.TChan
+import Control.Monad (forever)
 import Control.Monad.STM
 
 import Data.Map as Map
 
 import System.IO
 
+import Text.Printf
+
+import Network
 import Lib
 
 type ClientName = String
@@ -45,5 +50,33 @@ newServer = do
   c <- newTVarIO Map.empty
   return Server {clients = c}
 
+broadcast :: Server -> Message -> STM ()
+broadcast Server {..} msg = do
+  clientmap <- readTVar clients
+  mapM_ (\client -> sendMessage client msg) (Map.elems clientmap)
+
 main :: IO ()
-main = someFunc
+main = do
+  server <- newServer
+  sock <- listenOn (PortNumber (fromIntegral port))
+  printf "Listening on port %d\n" port
+  forever $ do
+      (handle, host, port) <- accept sock
+      printf "Accepted connection from %s: %s\n" host (show port)
+      forkFinally (talk handle server) (\_ -> hClose handle)
+
+port :: Int
+port = 4444
+
+checkAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
+checkAddClient server@Server {..} name handle = atomically $ do
+  clientmap <- readTVar clients
+  if Map.member name clientmap
+    then return Nothing
+    else do client <- newClient name handle
+            writeTVar clients $ Map.insert name client clientmap
+            broadcast server $ Notice (name ++ "has connected")
+            return (Just client)
+
+talk :: Handle -> Server -> IO ()
+talk = undefined

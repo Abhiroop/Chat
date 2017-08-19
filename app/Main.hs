@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
 module Main where
 
@@ -10,7 +11,11 @@ import Control.Exception
 import Control.Monad (forever, when, join, void)
 import Control.Monad.STM
 
+import Data.Typeable
+import Data.Binary
 import Data.Map as Map hiding (null)
+
+import GHC.Generics
 
 import System.IO
 
@@ -41,11 +46,13 @@ clientName (ClientLocal c) = localName c
 clientName (ClientRemote c) = remoteName c
 
 
-
 data Message = Notice String
              | Tell ClientName String
              | Broadcast ClientName String
              | Command String
+   deriving (Typeable, Generic)
+
+instance Binary Message
 
 newLocalClient :: ClientName -> Handle -> STM LocalClient
 newLocalClient name handle = do

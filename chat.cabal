@@ -29,6 +29,7 @@ executable chat-exe
                      , async
                      , containers >= 0.5.7.1
                      , network
+                     , distributed-process
                      , stm
   default-language:    Haskell2010
 

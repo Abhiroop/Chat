@@ -6,7 +6,7 @@ import Control.Concurrent (forkFinally)
 import Control.Concurrent.Async
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM.TChan
-import Control.Distributed.Process (ProcessId)
+import Control.Distributed.Process (ProcessId, Process, getSelfPid, liftIO, send)
 import Control.Exception
 import Control.Monad (forever, when, join, void)
 import Control.Monad.STM
@@ -64,16 +64,53 @@ newLocalClient name handle = do
                      ,clientSendChan = c
                      }
 
-data Server = Server {clients :: TVar (Map ClientName Client)}
+data PMessage
+  = MsgServers            [ProcessId]
+  | MsgSend               ClientName Message
+  | MsgBroadcast          Message
+  | MsgKick               ClientName ClientName
+  | MsgNewClient          ClientName ProcessId
+  | MsgClientDisconnected ClientName ProcessId
+  deriving (Typeable, Generic)
 
-newServer :: IO Server
-newServer = do
-  c <- newTVarIO Map.empty
-  return Server {clients = c}
+instance Binary PMessage
 
--- sendMessage :: Client -> Message -> STM ()
--- sendMessage Client{..} msg = writeTChan clientSendChan msg
+data Server = Server
+  { clients   :: TVar (Map ClientName Client)
+  , proxychan :: TChan (Process ())
+  , servers   :: TVar [ProcessId]
+  , spid      :: ProcessId --process id of the server for convenience
+  }
 
+newServer :: [ProcessId] -> Process Server
+newServer pids = do
+  pid <- getSelfPid
+  liftIO $ do
+    s <- newTVarIO pids
+    c <- newTVarIO Map.empty
+    o <- newTChanIO
+    return Server { clients = c, servers = s, proxychan = o, spid = pid }
+
+---------------SENDING MESSAGES--------------------------------
+
+sendLocal :: LocalClient -> Message -> STM ()
+sendLocal LocalClient{..} msg = writeTChan clientSendChan msg
+
+sendRemote :: Server -> ProcessId -> PMessage -> STM ()
+sendRemote Server{..} pid pmsg = writeTChan proxychan (send pid pmsg)
+
+sendMessage :: Server -> Client -> Message -> STM ()
+sendMessage server (ClientLocal client) msg = sendLocal client msg
+sendMessage server (ClientRemote client) msg = sendRemote server (clientHome client) (MsgSend (remoteName client) msg)
+
+sendToName :: Server -> ClientName -> Message -> STM Bool
+sendToName server@Server{..} name msg = do
+  clientmap <- readTVar clients
+  case Map.lookup name clientmap of
+    Nothing -> return False
+    Just client -> sendMessage server client msg >> return True
+
+----------------BROADCASTING-------------------------------
 -- broadcast :: Server -> Message -> STM ()
 -- broadcast Server {..} msg = do
 --   clientmap <- readTVar clients

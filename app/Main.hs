@@ -1,19 +1,30 @@
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
 module Main where
 
-import Control.Concurrent (forkFinally)
+import Control.Concurrent (forkFinally, forkIO)
 import Control.Concurrent.Async
 import Control.Concurrent.STM.TVar
 import Control.Concurrent.STM.TChan
-import Control.Distributed.Process (ProcessId, Process, getSelfPid, liftIO, send)
 import Control.Exception
-import Control.Monad (forever, when, join, void)
+import Control.Monad (forever, when, join, void, zipWithM)
 import Control.Monad.STM
+import Control.Distributed.Process.Closure
+import Control.Distributed.Process (ProcessId,
+                                    Process,
+                                    NodeId,
+                                    expect,
+                                    getSelfPid,
+                                    liftIO,
+                                    say,
+                                    send,
+                                    spawn,
+                                    spawnLocal)
 
 import Data.Typeable
 import Data.Binary
-import Data.Map as Map hiding (null)
+import Data.Map as Map hiding (null, filter)
 
 import GHC.Generics
 
@@ -23,6 +34,7 @@ import Text.Printf
 
 import Network
 import Lib
+import DistribUtils
 
 type ClientName = String
 
@@ -111,125 +123,194 @@ sendToName server@Server{..} name msg = do
     Just client -> sendMessage server client msg >> return True
 
 ----------------BROADCASTING-------------------------------
--- broadcast :: Server -> Message -> STM ()
--- broadcast Server {..} msg = do
---   clientmap <- readTVar clients
---   mapM_ (\client -> sendMessage client msg) (Map.elems clientmap)
+sendRemoteAll :: Server -> PMessage -> STM ()
+sendRemoteAll server@Server{..} pmsg = do
+  pids <- readTVar servers
+  mapM_ (\pid -> sendRemote server pid pmsg) pids
 
--- sendToName :: Server -> ClientName -> Message -> STM Bool
--- sendToName server@Server{..} name msg = do
---   clientmap <- readTVar clients
---   case Map.lookup name clientmap of
---     Nothing     -> return False
---     Just client -> sendMessage client msg >> return True
+broadcastLocal :: Server -> Message -> STM ()
+broadcastLocal server@Server{..} msg = do
+  clientmap <- readTVar clients
+  mapM_ sendIfLocal (Map.elems clientmap)
+ where sendIfLocal (ClientLocal c) = sendLocal c msg
+       sendIfLocal (ClientRemote _) = return ()
 
--- tell :: Server -> Client -> ClientName -> String -> IO ()
--- tell server@Server{..} Client{..} who msg = do
---   ok <- atomically $ sendToName server who (Tell clientName msg)
---   if ok
---      then return ()
---      else hPutStrLn clientHandle (who ++ " is not connected.")
+broadcast :: Server -> Message -> STM ()
+broadcast server@Server{..} msg = do
+  sendRemoteAll server (MsgBroadcast msg)
+  broadcastLocal server msg
 
--- kick :: Server -> ClientName -> ClientName -> STM ()
--- kick server@Server{..} who by = do
---   clientmap <- readTVar clients
---   case Map.lookup who clientmap of
---     Nothing ->
---       void $ sendToName server by (Notice $ who ++ " is not connected")
---     Just victim -> do
---       writeTVar (clientKicked victim) $ Just ("by " ++ by)
---       void $ sendToName server by (Notice $ "you kicked " ++ who)
+tell :: Server -> LocalClient -> ClientName -> String -> IO ()
+tell server@Server{..} LocalClient{..} who msg = do
+  ok <- atomically $ sendToName server who (Tell localName msg)
+  if ok
+     then return ()
+     else hPutStrLn clientHandle (who ++ " is not connected.")
 
-main :: IO ()
-main = undefined-- do
-  -- server <- newServer
-  -- sock <- listenOn (PortNumber (fromIntegral port))
-  -- printf "Listening on port %d\n" port
-  -- forever $ do
-  --     (handle, host, port) <- accept sock
-  --     printf "Accepted connection from %s: %s\n" host (show port)
-  --     forkFinally (talk handle server) (\_ -> hClose handle)
+kick :: Server -> ClientName -> ClientName -> STM ()
+kick server@Server{..} who by = do
+  clientmap <- readTVar clients
+  case Map.lookup who clientmap of
+    Nothing ->
+      void $ sendToName server by (Notice $ who ++ " is not connected")
+    Just (ClientLocal victim) -> do
+      writeTVar (clientKicked victim) $ Just ("by " ++ by)
+      void $ sendToName server by (Notice $ "you kicked " ++ who)
+    Just (ClientRemote victim) -> do
+      sendRemote server (clientHome victim) (MsgKick who by)
+
+socketListener :: Server -> Int -> IO ()
+socketListener server port = do
+  sock <- listenOn (PortNumber (fromIntegral port))
+  printf "Listening on port %d\n" port
+  forever $ do
+      (handle, host, port) <- accept sock
+      printf "Accepted connection from %s: %s\n" host (show port)
+      forkFinally (talk server handle) (\_ -> hClose handle)
+
+chatServer :: Int -> Process ()
+chatServer port = do
+  server <- newServer []
+  liftIO $ forkIO (socketListener server port)
+  spawnLocal $ proxy server
+  forever $ do m <- expect; handleRemoteMessage server m
+
+handleRemoteMessage :: Server -> PMessage -> Process ()
+handleRemoteMessage server@Server{..} m = liftIO $ atomically $
+  case m of
+    MsgServers pids -> writeTVar servers (filter (/= spid) pids)
+    MsgSend name msg -> void $ sendToName server name msg
+    MsgBroadcast msg -> broadcastLocal server msg
+    MsgKick who by   -> kick server who by
+    MsgNewClient name pid -> do
+        ok <- checkAddClient server (ClientRemote (RemoteClient name pid))
+        when (not ok) $
+          sendRemote server pid (MsgKick name "SYSTEM")
+
+    MsgClientDisconnected name pid -> do
+         clientmap <- readTVar clients
+         case Map.lookup name clientmap of
+            Nothing -> return ()
+            Just (ClientRemote (RemoteClient _ pid')) | pid == pid' ->
+              deleteClient server name
+            Just _ -> return ()
+
+proxy :: Server -> Process ()
+proxy Server{..} = forever $ join $ liftIO $ atomically $ readTChan proxychan
+
+checkAddClient :: Server -> Client -> STM Bool
+checkAddClient server@Server{..} client = do
+    clientmap <- readTVar clients
+    let name = clientName client
+    if Map.member name clientmap
+       then return False
+       else do writeTVar clients (Map.insert name client clientmap)
+               broadcastLocal server $ Notice $ name ++ " has connected"
+               return True
+
+removeClient :: Server -> ClientName -> IO ()
+removeClient server@Server{..} name = atomically $ do
+  modifyTVar' clients $ Map.delete name
+  broadcast server $ Notice (name ++ " has disconnected")
+
+talk :: Server -> Handle -> IO ()
+talk server@Server{..} handle = do
+    hSetNewlineMode handle universalNewlineMode
+        -- Swallow carriage returns sent by telnet clients
+    hSetBuffering handle LineBuffering
+    readName
+  where
+-- <<readName
+    readName = do
+      hPutStrLn handle "What is your name?"
+      name <- hGetLine handle
+      if null name
+         then readName
+         else mask $ \restore -> do
+                client <- atomically $ newLocalClient name handle
+                ok <- atomically $ checkAddClient server (ClientLocal client)
+                if not ok
+                  then restore $ do
+                     hPrintf handle
+                        "The name %s is in use, please choose another\n" name
+                     readName
+                  else do
+                     atomically $ sendRemoteAll server (MsgNewClient name spid)
+                     restore (runClient server client)
+                       `finally` disconnectLocalClient server name
+
+deleteClient :: Server -> ClientName -> STM ()
+deleteClient server@Server{..} name = do
+    modifyTVar' clients $ Map.delete name
+    broadcastLocal server $ Notice $ name ++ " has disconnected"
+
+disconnectLocalClient :: Server -> ClientName -> IO ()
+disconnectLocalClient server@Server{..} name = atomically $ do
+     deleteClient server name
+     sendRemoteAll server (MsgClientDisconnected name spid)
+
+runClient :: Server -> LocalClient -> IO ()
+runClient serv@Server{..} client@LocalClient{..} = do
+  race server receive
+  return ()
+ where
+  receive = forever $ do
+    msg <- hGetLine clientHandle
+    atomically $ sendLocal client (Command msg)
+
+  server = join $ atomically $ do
+    k <- readTVar clientKicked
+    case k of
+      Just reason -> return $
+        hPutStrLn clientHandle $ "You have been kicked: " ++ reason
+      Nothing -> do
+        msg <- readTChan clientSendChan
+        return $ do
+            continue <- handleMessage serv client msg
+            when continue $ server
+
+handleMessage :: Server -> LocalClient -> Message -> IO Bool
+handleMessage server client@LocalClient{..} message =
+  case message of
+     Notice msg         -> output $ "*** " ++ msg
+     Tell name msg      -> output $ "*" ++ name ++ "*: " ++ msg
+     Broadcast name msg -> output $ "<" ++ name ++ ">: " ++ msg
+     Command msg ->
+       case words msg of
+           ["/kick", who] -> do
+               atomically $ kick server who localName
+               return True
+           "/tell" : who : what -> do
+               tell server client who (unwords what)
+               return True
+           ["/quit"] ->
+               return False
+           ('/':_):_ -> do
+               hPutStrLn clientHandle $ "Unrecognised command: " ++ msg
+               return True
+           _ -> do
+               atomically $ broadcast server $ Broadcast localName msg
+               return True
+ where
+   output s = do hPutStrLn clientHandle s; return True
+
+remotable ['chatServer]
 
 port :: Int
-port = 4444
+port = 44444
 
--- checkAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
--- checkAddClient server@Server {..} name handle = atomically $ do
---   clientmap <- readTVar clients
---   if Map.member name clientmap
---     then return Nothing
---     else do client <- newClient name handle
---             writeTVar clients $ Map.insert name client clientmap
---             broadcast server $ Notice (name ++ "has connected")
---             return (Just client)
+master :: [NodeId] -> Process ()
+master peers = do
 
--- removeClient :: Server -> ClientName -> IO ()
--- removeClient server@Server{..} name = atomically $ do
---   modifyTVar' clients $ Map.delete name
---   broadcast server $ Notice (name ++ " has disconnected")
+  let run nid port = do
+         say $ printf "spawning on %s" (show nid)
+         spawn nid ($(mkClosure 'chatServer) port)
 
--- talk :: Handle -> Server -> IO ()
--- talk handle server@Server{..} = do
---   hSetNewlineMode handle universalNewlineMode
---   hSetBuffering handle LineBuffering
---   readName
---  where readName = do
---          hPutStrLn handle "What is your name?"
---          name <- hGetLine handle
---          if null name
---            then readName
---            else mask $ \restore -> do
---                   ok <- checkAddClient server name handle
---                   case ok of
---                     Nothing -> restore $ do
---                       hPrintf handle
---                         "The name %s is in use, please choose another\n" name
---                       readName
---                     Just client ->
---                       restore (runClient server client)
---                           `finally` removeClient server name
+  pids <- zipWithM run peers [port+1..]
+  mypid <- getSelfPid
+  let all_pids = mypid : pids
+  mapM_ (\pid -> send pid (MsgServers all_pids)) all_pids
 
--- runClient :: Server -> Client -> IO ()
--- runClient serv@Server{..} client@Client{..} = do
---   race server receive
---   return ()
---  where
---   receive = forever $ do
---     msg <- hGetLine clientHandle
---     atomically $ sendMessage client (Command msg)
+  chatServer port
 
---   server = join $ atomically $ do
---     k <- readTVar clientKicked
---     case k of
---       Just reason -> return $
---         hPutStrLn clientHandle $ "You have been kicked: " ++ reason
---       Nothing -> do
---         msg <- readTChan clientSendChan
---         return $ do
---             continue <- handleMessage serv client msg
---             when continue $ server
-
--- handleMessage :: Server -> Client -> Message -> IO Bool
--- handleMessage server client@Client{..} message =
---   case message of
---      Notice msg         -> output $ "*** " ++ msg
---      Tell name msg      -> output $ "*" ++ name ++ "*: " ++ msg
---      Broadcast name msg -> output $ "<" ++ name ++ ">: " ++ msg
---      Command msg ->
---        case words msg of
---            ["/kick", who] -> do
---                atomically $ kick server who clientName
---                return True
---            "/tell" : who : what -> do
---                tell server client who (unwords what)
---                return True
---            ["/quit"] ->
---                return False
---            ('/':_):_ -> do
---                hPutStrLn clientHandle $ "Unrecognised command: " ++ msg
---                return True
---            _ -> do
---                atomically $ broadcast server $ Broadcast clientName msg
---                return True
---  where
---    output s = do hPutStrLn clientHandle s; return True
+main = distribMain master Main.__remoteTable
